@@ -6,7 +6,7 @@ import streamlit as st
 
 BASE = "https://d266k7wxhw6o23.cloudfront.net/"
 
-st.set_page_config(page_title="Kentucky Mesonet — Stations", layout="wide")
+st.set_page_config(page_title="DSOC WBGT", layout="wide")
 
 # --------- Data helpers ---------
 @st.cache_data(ttl=15 * 60)
@@ -67,7 +67,7 @@ county_df = filtered[filtered["county"] == selected_county].copy()
 left, right = st.columns([2.2, 1.8], gap="large")
 
 with left:
-    st.markdown("### Commonwealth of Kentucky — Mesonet Stations")
+    st.markdown("### Commonwealth of Kentucky")
     # Statewide map
     if filtered.empty:
         st.info("No stations match the filters.")
@@ -96,7 +96,7 @@ with left:
 
 with right:
     # Top: Warren (or chosen county) zoom map
-    st.markdown(f"### {selected_county} County — zoom")
+    st.markdown(f"### {selected_county} County")
 
     if county_df.empty:
         st.info(f"No stations found for {selected_county} with current filters.")
