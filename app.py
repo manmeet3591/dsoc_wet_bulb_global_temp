@@ -1,4 +1,3 @@
-import json
 import requests
 import numpy as np
 import pandas as pd
@@ -10,54 +9,50 @@ BASE = "https://d266k7wxhw6o23.cloudfront.net/"
 
 st.set_page_config(page_title="DSOC WBGT", layout="wide")
 
-# ======================
+# -----------------------------
 # HTTP + caching helpers
-# ======================
+# -----------------------------
 @st.cache_data(ttl=15 * 60)
 def fetch_json(url: str):
     r = requests.get(url, timeout=25)
     r.raise_for_status()
     return r.json()
 
-# =============================
-# Discover stations + variables
-# =============================
+# -----------------------------
+# Stations + variable discovery
+# -----------------------------
 @st.cache_data(ttl=15 * 60)
 def load_station_catalog() -> pd.DataFrame:
-    # 1) Manifest → find current stations file (stable URL is the manifest)
     manifest = fetch_json(BASE + "metadata/manifest.json")
-    stations_key = manifest["stations"]["key"]  # e.g. metadata/stations_<hash>.json
+    stations_key = manifest["stations"]["key"]
     stations = fetch_json(BASE + stations_key)
-
     df = pd.DataFrame(stations)
-    # Tidy up types/labels
-    df.rename(
-        columns={
-            "relativeName": "name",
-            "lat": "latitude",
-            "lon": "longitude",
-        },
-        inplace=True,
-    )
+    df.rename(columns={"relativeName": "name", "lat": "latitude", "lon": "longitude"}, inplace=True)
     df["establishedAt"] = pd.to_datetime(df["establishedAt"], errors="coerce")
     return df
 
 @st.cache_data(ttl=24 * 60 * 60)
 def discover_variable_codes():
-    """Return likely variable codes for dew point, air temp, RH. Robust to different manifest shapes."""
+    """
+    Returns sets of candidate codes for dewpoint, air temp, and RH.
+    Handles multiple possible shapes of the variables manifest.
+    """
     manifest = fetch_json(BASE + "metadata/manifest.json")
     vars_key = manifest.get("variables", {}).get("key")
 
-    dew_codes = {"td", "dewpoint", "dew_point"}   # safe defaults
+    dew_codes = {"td", "dewpoint", "dew_point"}  # safe defaults
     t_codes   = {"ta", "tair", "temp"}
     rh_codes  = {"rh"}
 
     if vars_key:
         raw = fetch_json(BASE + vars_key)
 
-        # Normalize to a list of dicts
+        # normalize to list[dict]
         items = []
-        if isinstance(raw, dict):
+        if isinstance(raw, list):
+            for v in raw:
+                items.append(v if isinstance(v, dict) else {"name": str(v)})
+        elif isinstance(raw, dict):
             if isinstance(raw.get("variables"), list):
                 items = raw["variables"]
             else:
@@ -66,9 +61,6 @@ def discover_variable_codes():
                         items.append({"code": k, **v})
                     else:
                         items.append({"code": k, "name": str(v)})
-        elif isinstance(raw, list):
-            for v in raw:
-                items.append(v if isinstance(v, dict) else {"name": str(v)})
 
         for item in items:
             text = " ".join(
@@ -92,14 +84,10 @@ def discover_variable_codes():
 df = load_station_catalog()
 var_codes = discover_variable_codes()
 
-# ===================================
-# Latest observation & dewpoint logic
-# ===================================
+# -----------------------------
+# Latest observation helpers
+# -----------------------------
 def _choose_latest_key(manifest_json):
-    """
-    Year manifest can be a list of chunks with 'key' fields or a dict with 'key'.
-    Prefer entries that look realtime and the newest timestamp if present.
-    """
     if isinstance(manifest_json, list) and manifest_json:
         def score(item):
             k = str(item.get("key", "")).lower()
@@ -119,10 +107,6 @@ def _choose_latest_key(manifest_json):
     return None
 
 def _extract_latest_record(payload):
-    """
-    Try several shapes: list[dict] (timeseries), dict with 'data'/'records'/'observations'/'obs'.
-    Return most recent record.
-    """
     if isinstance(payload, list) and payload:
         return payload[-1] if isinstance(payload[-1], dict) else None
     if isinstance(payload, dict):
@@ -139,7 +123,6 @@ def _first_present(d: dict, keys):
     return None
 
 def _dew_from_t_rh(tc, rh):
-    """Magnus formula: inputs °C and % → returns dew point °C."""
     if tc is None or rh is None:
         return None
     try:
@@ -170,7 +153,6 @@ def fetch_station_dewpoint(abbrev: str):
         if not isinstance(rec, dict):
             return (None, None)
 
-        # Direct dew point if present
         dp = _first_present(rec, var_codes["dew"])
         if dp is not None:
             try:
@@ -178,7 +160,6 @@ def fetch_station_dewpoint(abbrev: str):
             except Exception:
                 pass
 
-        # Compute from T (°C) and RH (%)
         tc = _first_present(rec, var_codes["t"])
         rh = _first_present(rec, var_codes["rh"])
         dp = _dew_from_t_rh(tc, rh)
@@ -188,19 +169,16 @@ def fetch_station_dewpoint(abbrev: str):
 
 @st.cache_data(ttl=5 * 60, show_spinner=True)
 def attach_dewpoints(stations_df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, r in stations_df.iterrows():
-        dp, ts = fetch_station_dewpoint(r["abbrev"])
-        rows.append(dp)
     out = stations_df.copy()
-    out["dewpoint_C"] = rows
+    out["dewpoint_C"] = [
+        fetch_station_dewpoint(abbrev)[0] for abbrev in out["abbrev"].tolist()
+    ]
     return out
 
-# ===================
-# Sidebar / filtering
-# ===================
+# -----------------------------
+# Sidebar / filters
+# -----------------------------
 st.sidebar.title("Controls")
-
 counties = sorted(df["county"].dropna().unique().tolist())
 default_idx = counties.index("Warren") if "Warren" in counties else 0
 selected_county = st.sidebar.selectbox("County for detail view", counties, index=default_idx)
@@ -218,26 +196,25 @@ if has_inversion:
 if has_camera:
     filtered = filtered[filtered["hasCamera"] == 1]
 
-# Fetch dew points (adds dewpoint_C column)
 with st.spinner("Fetching latest dew point values…"):
     filtered = attach_dewpoints(filtered)
 
 county_df = filtered[filtered["county"] == selected_county].copy()
 
-# ==========
-# Main layout
-# ==========
-left, right = st.columns([2.2, 1.8], gap="large")
+# -----------------------------
+# Map drawing helper (with fallback)
+# -----------------------------
+def draw_scatter_map(data: pd.DataFrame, zoom: int, height: int, center=None, color_col=None):
+    """
+    Use px.scatter_map when available; fall back to px.scatter_mapbox.
+    If color_col is None OR all-NaN → render neutral points (no legend).
+    """
+    use_color = color_col and data[color_col].notna().any()
+    color_arg = color_col if use_color else None
 
-with left:
-    st.markdown("### Commonwealth of Kentucky")
-    if filtered.empty:
-        st.info("No stations match the filters.")
-    else:
-        # NOTE: We do NOT color by county → no big county legend
-        # Use dew point as continuous color (set color=None to remove legend entirely)
-        fig_state = px.scatter_map(
-            filtered,
+    try:
+        fig = px.scatter_map(
+            data,
             lat="latitude",
             lon="longitude",
             hover_name="name",
@@ -249,16 +226,51 @@ with left:
                 "latitude": False,
                 "longitude": False,
             },
-            color="dewpoint_C",
+            color=color_arg,
             color_continuous_scale="Viridis",
-            zoom=6,
-            height=620,
+            zoom=zoom,
+            height=height,
             map_style="carto-positron",
+            center=center,
         )
-        fig_state.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0),
-            coloraxis_colorbar=dict(title="Dew Point (°C)"),
+    except AttributeError:
+        # Older Plotly → fall back (may show deprecation warnings)
+        fig = px.scatter_mapbox(
+            data,
+            lat="latitude",
+            lon="longitude",
+            hover_name="name",
+            hover_data={
+                "abbrev": True,
+                "county": True,
+                "dewpoint_C": True,
+                "timezone": True,
+                "latitude": False,
+                "longitude": False,
+            },
+            color=color_arg,
+            color_continuous_scale="Viridis",
+            zoom=zoom,
+            height=height,
+            mapbox_style="carto-positron",
+            center=center,
         )
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+    if use_color:
+        fig.update_layout(coloraxis_colorbar=dict(title="Dew Point (°C)"))
+    return fig
+
+# -----------------------------
+# Layout
+# -----------------------------
+left, right = st.columns([2.2, 1.8], gap="large")
+
+with left:
+    st.markdown("### Commonwealth of Kentucky")
+    if filtered.empty:
+        st.info("No stations match the filters.")
+    else:
+        fig_state = draw_scatter_map(filtered, zoom=6, height=620, center=None, color_col="dewpoint_C")
         st.plotly_chart(fig_state, use_container_width=True)
 
 with right:
@@ -266,31 +278,10 @@ with right:
     if county_df.empty:
         st.info(f"No stations found for {selected_county} with current filters.")
     else:
-        center_lat = county_df["latitude"].mean()
-        center_lon = county_df["longitude"].mean()
-
-        fig_county = px.scatter_map(
-            county_df,
-            lat="latitude",
-            lon="longitude",
-            hover_name="name",
-            hover_data={
-                "abbrev": True,
-                "dewpoint_C": True,
-                "timezone": True,
-                "latitude": False,
-                "longitude": False,
-            },
-            color="dewpoint_C",
-            color_continuous_scale="Viridis",
-            zoom=9,
-            height=320,
-            map_style="carto-positron",
-            center={"lat": center_lat, "lon": center_lon},
-        )
-        fig_county.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0),
-            coloraxis_colorbar=dict(title="Dew Point (°C)"),
+        center_lat = float(county_df["latitude"].mean())
+        center_lon = float(county_df["longitude"].mean())
+        fig_county = draw_scatter_map(
+            county_df, zoom=9, height=320, center={"lat": center_lat, "lon": center_lon}, color_col="dewpoint_C"
         )
         st.plotly_chart(fig_county, use_container_width=True)
 
@@ -298,6 +289,7 @@ with right:
     if county_df.empty:
         st.stop()
 
+    # Table: safe formatting even when dewpoint is None
     display_cols = [
         "abbrev",
         "name",
@@ -323,13 +315,17 @@ with right:
         .sort_values("Station")
     )
 
+    def fmt_dp(x):
+        return "" if pd.isna(x) else f"{x:.2f}"
+
+    def fmt_date(x):
+        try:
+            return x.date().isoformat()
+        except Exception:
+            return ""
+
     st.dataframe(
-        pretty.style.format(
-            {
-                "Dew Point (°C)": "{:.2f}",
-                "Established": lambda t: t.date().isoformat() if pd.notnull(t) else "",
-            }
-        ),
+        pretty.style.format({"Dew Point (°C)": fmt_dp, "Established": fmt_date}),
         use_container_width=True,
         hide_index=True,
     )
